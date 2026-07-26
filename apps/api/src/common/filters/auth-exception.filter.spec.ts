@@ -142,3 +142,101 @@ describe('AuthExceptionFilter — Regression & Edge Case Coverage', () => {
     });
   });
 });
+
+describe('AuthExceptionFilter — Hardened Edge Cases & Failure Modes', () => {
+  let filter: AuthExceptionFilter;
+
+  const mockResponse = () => {
+    const res: any = {};
+    res.status = jest.fn().mockReturnValue(res);
+    res.json = jest.fn().mockReturnValue(res);
+    return res;
+  };
+
+  const mockArgumentsHost = (request: any, response: any): ArgumentsHost =>
+    ({
+      switchToHttp: () => ({
+        getRequest: () => request,
+        getResponse: () => response,
+      }),
+    } as unknown as ArgumentsHost);
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [AuthExceptionFilter],
+    }).compile();
+
+    filter = module.get<AuthExceptionFilter>(AuthExceptionFilter);
+  });
+
+  // ─── 1. Operational Failure Isolation & Retry Hints ────────────────────
+
+  describe('Operational Failures & Retry Hints', () => {
+    it('sets retryable flag to true on 503 SERVICE_UNAVAILABLE', () => {
+      const res = mockResponse();
+      const host = mockArgumentsHost({ url: '/api/v1/auth/verify', method: 'POST' }, res);
+      const exception = new HttpException('RPC Timeout', HttpStatus.SERVICE_UNAVAILABLE);
+
+      filter.catch(exception, host);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: 503,
+          errorCode: 'AUTH_SERVICE_UNAVAILABLE',
+          retryable: true,
+        }),
+      );
+    });
+
+    it('masks internal non-HTTP exceptions with 500 status and generic error message', () => {
+      const res = mockResponse();
+      const host = mockArgumentsHost({ url: '/api/v1/auth/verify', method: 'POST' }, res);
+      const unhandledError = new Error('Database connection crashed');
+
+      filter.catch(unhandledError, host);
+
+      expect(res.status).toHaveBeenCalledWith(HttpStatus.INTERNAL_SERVER_ERROR);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: 500,
+          errorCode: 'INTERNAL_AUTH_ERROR',
+          message: 'Internal authentication processing error',
+          retryable: false,
+        }),
+      );
+    });
+  });
+
+  // ─── 2. Malformed Payload & Empty State Sanitization ─────────────────────
+
+  describe('Malformed Payload Sanitization', () => {
+    it('handles empty message arrays without throwing runtime errors', () => {
+      const res = mockResponse();
+      const host = mockArgumentsHost({ url: '/api/v1/auth/me', method: 'GET' }, res);
+      const exception = new HttpException({ message: [] }, HttpStatus.BAD_REQUEST);
+
+      filter.catch(exception, host);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: 400,
+          message: 'An unexpected authentication error occurred',
+        }),
+      );
+    });
+
+    it('sanitizes whitespace-only message strings', () => {
+      const res = mockResponse();
+      const host = mockArgumentsHost({ url: '/api/v1/auth/me', method: 'GET' }, res);
+      const exception = new HttpException('   ', HttpStatus.UNAUTHORIZED);
+
+      filter.catch(exception, host);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: 'An unexpected authentication error occurred',
+        }),
+      );
+    });
+  });
+});
